@@ -1,169 +1,205 @@
-import NextAuth from 'next-auth';
-import GitHubProvider from 'next-auth/providers/github';
-import GoogleProvider from 'next-auth/providers/google';
-import CredentialsProvider from 'next-auth/providers/credentials';
-import bcrypt from 'bcryptjs';
-import dbConnect from '@/lib/dbConnect';
-import User from '@/app/models/User';
+import NextAuth, { DefaultSession } from "next-auth";
+import GitHubProvider from "next-auth/providers/github";
+import GoogleProvider from "next-auth/providers/google";
+import CredentialsProvider from "next-auth/providers/credentials";
+import bcrypt from "bcryptjs";
+import dbConnect from "@/lib/dbConnect";
+import User from "@/app/models/User";
+
+export type ExtendedUser = DefaultSession["user"] & {
+  provider: string;
+};
+
+declare module "next-auth" {
+  /**
+   * Returned by `auth`, `useSession`, `getSession` and received as a prop on the `SessionProvider` React Context
+   */
+  interface Session {
+    user: ExtendedUser;
+  }
+}
 
 export const { handlers, signIn, signOut, auth } = NextAuth({
   providers: [
     CredentialsProvider({
-      name: 'Credentials',
+      name: "Credentials",
       async authorize(credentials) {
         const { email, password, rememberMe } = credentials || {};
 
         if (!email || !password) {
-          return null; // Missing credentials
+          throw new Error("Missing credentials");
         }
 
         await dbConnect();
-
-        // Find the user in the database
         const user = await User.findOne({ email });
 
-        if(!user || typeof password !== "string"){
-          return null;
+        if (!user || typeof password !== "string") {
+          throw new Error("Invalid credentials");
         }
 
-        // Validate the password
         if (user && bcrypt.compareSync(password, user.password)) {
-          return { id: user._id.toString(), name: user.name, email: user.email, rememberMe };
+          return {
+            id: user._id.toString(),
+            name: user.name,
+            email: user.email,
+            rememberMe,
+          };
         }
 
-
-        return null; // Invalid credentials
+        throw new Error("Invalid credentials");
+      },
+    }),
+    GoogleProvider({
+      clientId: process.env.GOOGLE_CLIENT_ID as string,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET as string,
+      authorization: {
+        params: {
+          prompt: "consent",
+          access_type: "offline",
+          response_type: "code",
+        },
       },
     }),
     GitHubProvider({
       clientId: process.env.GITHUB_CLIENT_ID as string,
       clientSecret: process.env.GITHUB_CLIENT_SECRET as string,
     }),
-    GoogleProvider({
-      clientId: process.env.GOOGLE_CLIENT_ID as string,
-      clientSecret: process.env.GOOGLE_CLIENT_SECRET as string,
-    }),
   ],
   session: {
-    strategy: 'jwt', // Use JWT for sessions
+    strategy: "jwt",
     maxAge: 30 * 24 * 60 * 60, // 30 days
   },
-  // cookies: {
-  //   sessionToken: {
-  //     name: `__Secure-next-auth.session-token`,
-  //     options: {
-  //       httpOnly: true,
-  //       secure: process.env.NODE_ENV === "production",
-  //       sameSite: "lax",
-  //       path: "/",
-  //     },
-  //   },
-  // },
-  pages: {
-    signIn: '/login',
-  },
-  trustHost: true, 
   callbacks: {
     async signIn({ user, account, profile }) {
-
-      // if(!profile){
-      //   return false;
-      // }
-
-      await dbConnect();
-
-      if (account?.provider === 'github') {
-        const existingUser = await User.findOne({ githubId: profile?.id });
-
-        if (!existingUser) {
-          const newUser = new User({
-            name: profile?.name || profile?.login,
-            email: profile?.email || `${profile?.id}@github.com`, // Fallback email
-            avatar: profile?.avatar_url,
-            githubId: profile?.id,
-            coursesBought: [],
-          });
-          await newUser.save();
-        }
+      if (!profile) {
+        console.error("No profile data received");
+        return false;
       }
 
-      if (account?.provider === 'google') {
-        const existingUser = await User.findOne({ email: profile?.email });
+      try {
+        await dbConnect();
 
-        if (!existingUser) {
-          const newUser = new User({
-            name: profile?.name,
-            email: profile?.email,
-            avatar: profile?.picture,
-            googleId: profile?.sub,
-            coursesBought: [],  
-          });
-          await newUser.save();
+        if (account?.provider === "google") {
+          const existingUser = await User.findOne({ email: profile.email });
+
+          if (!existingUser) {
+            const newUser = new User({
+              name: profile.name,
+              email: profile.email,
+              avatar: profile.picture,
+              googleId: profile.sub,
+              coursesBought: [],
+            });
+            await newUser.save();
+          } else {
+            // Update existing user's Google ID if not set
+            if (!existingUser.googleId) {
+              existingUser.googleId = profile.sub;
+              existingUser.avatar = profile.picture || existingUser.avatar;
+              await existingUser.save();
+            }
+          }
         }
-      }
 
-      return true;
+        // Similar logic for GitHub...
+        if (account?.provider === "github") {
+          const existingUser = await User.findOne({
+            $or: [{ githubId: profile.id }, { email: profile.email }],
+          });
+
+          if (!existingUser) {
+            const newUser = new User({
+              name: profile.name || profile.login,
+              email: profile.email || `${profile.id}@github.com`,
+              avatar: profile.avatar_url,
+              githubId: profile.id,
+              coursesBought: [],
+            });
+            await newUser.save();
+          } else {
+            // Update existing user's GitHub ID if not set
+            if (!existingUser.githubId) {
+              existingUser.githubId = profile.id;
+              existingUser.avatar = profile.avatar_url || existingUser.avatar;
+              await existingUser.save();
+            }
+          }
+        }
+
+        return true;
+      } catch (error) {
+        console.error("Error in signIn callback:", error);
+        return false;
+      }
     },
     async jwt({ token, user, account, profile }) {
-      await dbConnect();
+      try {
+        await dbConnect();
+        let dbUser = null;
 
-      let dbUser = null;
+        if (account?.provider === "google" && profile?.sub) {
+          dbUser = await User.findOne({ googleId: profile.sub });
+        } else if (account?.provider === "github" && profile?.id) {
+          dbUser = await User.findOne({ githubId: profile.id });
+        } else if (user?.email) {
+          dbUser = await User.findOne({ email: user.email });
+        }
 
-      // Check if we are dealing with GitHub or Google OAuth
-      if (account?.provider === 'github' && profile?.id) {
-        dbUser = await User.findOne({ githubId: profile.id });
+        if (dbUser) {
+          token.id = dbUser._id.toString();
+          token.image = dbUser.avatar || token.picture || null;
+        } else if (user?.id) {
+          token.id = user.id;
+        }
 
-        // Use the avatar from the database if it exists, otherwise fallback to the provider's avatar
-        token.image = dbUser?.avatar || profile?.avatar_url || null;
-      } else if (account?.provider === 'google' && profile?.sub) {
-        dbUser = await User.findOne({ googleId: profile.sub });
-        // Use the avatar from the database if it exists, otherwise fallback to the provider's avatar
-        token.image = dbUser?.avatar || profile?.picture || null;
+        if (!token.id) {
+          throw new Error("Invalid user data in JWT callback");
+        }
+
+        token.provider = account?.provider || null;
+        return token;
+      } catch (error) {
+        console.error("Error in jwt callback:", error);
+        throw error;
       }
-
-      // credential user or not?
-      if (!dbUser && user) {
-        dbUser = await User.findOne({ email: user.email });
-
-        // Use the avatar from the database if it exists
-        token.image = dbUser?.avatar || null;
-      }
-
-      if (dbUser) {
-        token.id = dbUser._id.toString(); // MongoDB ObjectId
-      } else if (user?.id) {
-        token.id = user.id; // Fallback
-      }
-
-      if (!token.id) {
-        console.error('No valid user ID found during JWT callback');
-        throw new Error('Invalid user data in JWT callback');
-      }
-
-      if (user) {
-        token.rememberMe = (user as any).rememberMe || false;
-        token.name = user.name;
-        token.email = user.email;
-      }
-
-      token.provider = account?.provider || null;
-
-      return token;
     },
-    async session({ session, token }) {
-      if (token) {
-        session.user.id = token.id as string;
-        session.user.name = token.name;
-        session.user.email = token.email as string;
-        session.user.image = token.image as string;
-        (session.user as any).provider = token.provider as string;
+    async session({ session, token }: { session: any; token: any }) {
+      if (!token) {
+        return session;
       }
-      session.expires = token.rememberMe
-      ? (new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()  as unknown as string & Date) // 30 days
-      : (new Date(Date.now() + 60 * 60 * 1000).toISOString()  as unknown as string & Date) // 1 hour
 
-      return session;
+      try {
+        session.user = {
+          id: String(token.id || ""),
+          name: token.name || "",
+          email: String(token.email || ""),
+          image: String(token.image || ""),
+          provider: String(token.provider || ""),
+        };
+
+        // Calculate expiration time based on remember me preference
+        const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+        const ONE_HOUR_MS = 60 * 60 * 1000;
+
+        // Create Date object for expiration
+        const expirationTime = new Date(
+          Date.now() + (token.rememberMe ? THIRTY_DAYS_MS : ONE_HOUR_MS)
+        );
+
+        // Assign directly without conversion - it's already a Date object
+        session.expires = expirationTime;
+
+        return session;
+      } catch (error) {
+        console.error("Error updating session:", error);
+        throw new Error("Failed to update session");
+      }
     },
   },
+  pages: {
+    signIn: "/login",
+    error: "/auth/error", // Add this line to handle auth errors
+  },
+  debug: process.env.NODE_ENV === "development",
   secret: process.env.AUTH_SECRET,
 });
