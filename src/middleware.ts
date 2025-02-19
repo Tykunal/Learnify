@@ -16,6 +16,7 @@ export async function middleware(req: NextRequest) {
     if (isAuth && (isLoginPage || isForgetPasswordPage)) {
       console.log("Redirecting authenticated user to /dashboard");
       return NextResponse.redirect(new URL('/dashboard', req.url));
+      // DashBoard is the correct route name.
     }
 
     // If unauthenticated, prevent access to protected routes
